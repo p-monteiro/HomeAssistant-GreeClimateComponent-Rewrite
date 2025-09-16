@@ -1,117 +1,153 @@
-"""Support for Gree sensors."""
+"""Gree Sensor Entity for Home Assistant."""
 
+from collections.abc import Callable
+from dataclasses import dataclass
 import logging
+
 from homeassistant.components.sensor import (
-    SensorEntity,
     SensorDeviceClass,
+    SensorEntity,
+    SensorEntityDescription,
     SensorStateClass,
 )
-from homeassistant.const import (
-    PERCENTAGE,
-)
-from homeassistant.helpers.device_registry import DeviceInfo
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import PERCENTAGE, UnitOfTemperature
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.restore_state import RestoreEntity
 
-from .const import DOMAIN
+from .coordinator import GreeConfigEntry, GreeCoordinator
+from .entity import GreeEntity, GreeEntityDescription
+from .gree_device import GreeDevice
 
 _LOGGER = logging.getLogger(__name__)
 
+GATTR_INDOOR_TEMPERATURE = "indoor_temperature"
+GATTR_OUTDOOR_TEMPERATURE = "outdoor_temperature"
+GATTR_HUMIDITY = "humidity"
 
-async def async_setup_entry(hass, entry, async_add_entities):
-    """Set up Gree sensors from a config entry."""
-    # Get the device that was created in __init__.py
-    entry_data = hass.data[DOMAIN][entry.entry_id]
-    device = entry_data["device"]
+
+@dataclass(frozen=True, kw_only=True)
+class GreeSensorDescription(GreeEntityDescription, SensorEntityDescription):
+    """Description of a Gree temperature sensor."""
+
+    value_func: Callable[[GreeDevice], float | None]
+
+
+SENSOR_TYPES: tuple[GreeSensorDescription, ...] = (
+    GreeSensorDescription(
+        key=GATTR_INDOOR_TEMPERATURE,
+        translation_key=GATTR_INDOOR_TEMPERATURE,
+        device_class=SensorDeviceClass.TEMPERATURE,
+        state_class=SensorStateClass.MEASUREMENT,
+        native_unit_of_measurement=UnitOfTemperature.CELSIUS,
+        suggested_display_precision=0,
+        value_func=lambda device: device.indoors_temperature_c,
+        available_func=lambda device: device.has_indoor_temperature_sensor,
+    ),
+    GreeSensorDescription(
+        key=GATTR_OUTDOOR_TEMPERATURE,
+        translation_key=GATTR_OUTDOOR_TEMPERATURE,
+        device_class=SensorDeviceClass.TEMPERATURE,
+        state_class=SensorStateClass.MEASUREMENT,
+        native_unit_of_measurement=UnitOfTemperature.CELSIUS,
+        suggested_display_precision=0,
+        value_func=lambda device: device.outdoors_temperature_c,
+        available_func=lambda device: device.has_outdoor_temperature_sensor,
+    ),
+    GreeSensorDescription(
+        key=GATTR_HUMIDITY,
+        translation_key=GATTR_HUMIDITY,
+        device_class=SensorDeviceClass.HUMIDITY,
+        state_class=SensorStateClass.MEASUREMENT,
+        native_unit_of_measurement=PERCENTAGE,
+        suggested_display_precision=0,
+        value_func=lambda device: device.humidity,
+        available_func=lambda device: device.has_humidity_sensor,
+    ),
+)
+
+
+async def async_setup_entry(
+    hass: HomeAssistant,
+    entry: GreeConfigEntry,
+    async_add_entities: AddEntitiesCallback,
+) -> None:
+    """Set up sensors from a config entry."""
+
+    coordinator = entry.runtime_data
 
     sensors = []
 
-    sensors.append(GreeOutsideTemperatureSensor(device))
-    _LOGGER.debug("Added outside temperature sensor")
+    if coordinator.device.has_indoor_temperature_sensor:
+        sensors.append(GATTR_INDOOR_TEMPERATURE)
+    if coordinator.device.has_outdoor_temperature_sensor:
+        sensors.append(GATTR_OUTDOOR_TEMPERATURE)
+    if coordinator.device.has_humidity_sensor:
+        sensors.append(GATTR_HUMIDITY)
 
-    sensors.append(GreeRoomHumiditySensor(device))
-    _LOGGER.debug("Added room humidity sensor")
+    _LOGGER.debug("Adding Sensor Entities: %s", sensors)
 
-    if sensors:
-        async_add_entities(sensors)
-        _LOGGER.info(f"Added {len(sensors)} Gree sensors")
+    entities = [
+        GreeSensor(description, coordinator, restore_state=True)
+        for description in SENSOR_TYPES
+        if description.key in sensors
+    ]
+
+    async_add_entities(entities)
 
 
-class GreeOutsideTemperatureSensor(SensorEntity):
-    """Gree outside temperature sensor."""
+async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry):
+    """Unload a config entry."""
+    return True
 
-    def __init__(self, device):
+
+class GreeSensor(GreeEntity, SensorEntity, RestoreEntity):  # pyright: ignore[reportIncompatibleVariableOverride]
+    """A Gree Sensor."""
+
+    entity_description: GreeSensorDescription
+
+    def __init__(
+        self,
+        description: GreeSensorDescription,
+        coordinator: GreeCoordinator,
+        restore_state: bool = True,
+    ) -> None:
         """Initialize the sensor."""
-        self._device = device
-        self._attr_name = f"{device.name} Outside Temperature"
-        self._attr_unique_id = f"{device.unique_id}_outside_temp"
-        self._attr_device_class = SensorDeviceClass.TEMPERATURE
-        self._attr_state_class = SensorStateClass.MEASUREMENT
-        self._attr_native_unit_of_measurement = device.temperature_unit
-        self._attr_suggested_display_precision = 0
+        super().__init__(coordinator, restore_state)
+
+        self.entity_description = description  # pyright: ignore[reportIncompatibleVariableOverride]
+        self._attr_unique_id = f"{self._device.name}_{description.key}"
+        _LOGGER.debug("Initialized sensor %s", self._attr_unique_id)
 
     @property
-    def device_info(self) -> DeviceInfo:
-        """Return device information."""
-        return DeviceInfo(
-            identifiers={(DOMAIN, self._device._mac_addr)},
-            name=self._device.name,
-            manufacturer="Gree",
+    def available(self):  # pyright: ignore[reportIncompatibleVariableOverride]
+        """Return True if entity is available."""
+        return self._device.available and self.entity_description.available_func(
+            self._device
         )
 
     @property
-    def native_value(self):
+    def native_value(self):  # pyright: ignore[reportIncompatibleVariableOverride]
         """Return the state of the sensor."""
-        # Only return value if sensor is detected and available
-        if self._device._has_outside_temp_sensor:
-            return self._device.outside_temperature
-        return None
+        return self.entity_description.value_func(self._device)
 
-    @property
-    def available(self):
-        """Return True if entity is available."""
-        return self._device.available and self._device._has_outside_temp_sensor
-
-    def update(self):
-        """Update the sensor."""
-        # The climate entity handles the actual data fetching
-        pass
-
-
-class GreeRoomHumiditySensor(SensorEntity):
-    """Gree room humidity sensor."""
-
-    def __init__(self, device):
-        """Initialize the sensor."""
-        self._device = device
-        self._attr_name = f"{device.name} Room Humidity"
-        self._attr_unique_id = f"{device.unique_id}_room_humidity"
-        self._attr_device_class = SensorDeviceClass.HUMIDITY
-        self._attr_state_class = SensorStateClass.MEASUREMENT
-        self._attr_native_unit_of_measurement = PERCENTAGE
-        self._attr_suggested_display_precision = 0
-
-    @property
-    def device_info(self) -> DeviceInfo:
-        """Return device information."""
-        return DeviceInfo(
-            identifiers={(DOMAIN, self._device._mac_addr)},
-            name=self._device.name,
-            manufacturer="Gree",
-        )
-
-    @property
-    def native_value(self):
-        """Return the state of the sensor."""
-        # Only return value if sensor is detected and available
-        if self._device._has_room_humidity_sensor:
-            return self._device.room_humidity
-        return None
-
-    @property
-    def available(self):
-        """Return True if entity is available."""
-        return self._device.available and self._device._has_room_humidity_sensor
-
-    def update(self):
-        """Update the sensor."""
-        # The climate entity handles the actual data fetching
-        pass
+    async def async_added_to_hass(self):
+        """Handle entity which will be added."""
+        await super().async_added_to_hass()
+        # Restore last HA state to device if applicable
+        if self.restore_state:
+            last_state = await self.async_get_last_state()
+            if last_state is not None:
+                _LOGGER.debug(
+                    "Restoring state for %s: %s", self.entity_id, last_state.state
+                )
+                if last_state.state not in (None, "unknown", "unavailable"):
+                    try:
+                        self._attr_native_value = float(last_state.state)
+                    except ValueError as err:
+                        _LOGGER.error(
+                            "Failed to restore state for %s: %s",
+                            self.entity_id,
+                            repr(err),
+                        )
